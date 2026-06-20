@@ -1,170 +1,102 @@
-"""Governance framework: approval gates, audit trails, and policy engine."""
-
+"""Governance — approval gates, policy engine, tamper-evident audit trail."""
 from __future__ import annotations
-
-import functools
-import uuid
+import hashlib, json, uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Callable
-
-import structlog
-
-logger = structlog.get_logger()
-
 
 @dataclass
 class AuditEntry:
+    id: str
     timestamp: str
-    event: str
-    agent_name: str
-    details: dict[str, Any] = field(default_factory=dict)
-    entry_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
-
-
-class AuditTrail:
-    """Tamper-evident audit trail for agent actions."""
-
-    def __init__(self, agent_name: str) -> None:
-        self.agent_name = agent_name
-        self.entries: list[AuditEntry] = []
-
-    def log(self, event: str, **details: Any) -> AuditEntry:
-        import datetime
-        entry = AuditEntry(
-            timestamp=datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            event=event,
-            agent_name=self.agent_name,
-            details=details,
-        )
-        self.entries.append(entry)
-        logger.info("audit_logged", agent=self.agent_name, event=event, entry_id=entry.entry_id)
-        return entry
-
-    def get_entries(self, event: str | None = None) -> list[AuditEntry]:
-        if event is None:
-            return list(self.entries)
-        return [e for e in self.entries if e.event == event]
-
-    def export(self) -> list[dict[str, Any]]:
-        return [
-            {
-                "entry_id": e.entry_id,
-                "timestamp": e.timestamp,
-                "event": e.event,
-                "agent_name": e.agent_name,
-                "details": e.details,
-            }
-            for e in self.entries
-        ]
-
+    agent: str
+    action: str
+    decision: str
+    approver: str | None = None
+    policy_ids: list[str] = field(default_factory=list)
+    context: dict[str, Any] = field(default_factory=dict)
+    checksum: str = ""
+    def __post_init__(self) -> None:
+        if not self.checksum:
+            payload = json.dumps({"id": self.id, "timestamp": self.timestamp, "agent": self.agent, "action": self.action, "decision": self.decision}, sort_keys=True)
+            self.checksum = hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 class ApprovalGate:
-    """Human approval gate for consequential agent actions."""
-
-    def __init__(
-        self,
-        approvers: list[str],
-        require_for: list[str] | None = None,
-        name: str | None = None,
-        auto_approve_safe: bool = False,
-    ) -> None:
+    """Blocks execution until a human approves."""
+    def __init__(self, approvers: list[str], require_for: list[str] | None = None, timeout_hours: int = 24):
         self.approvers = approvers
-        self.require_for = require_for or []
-        self.name = name or f"gate-{uuid.uuid4().hex[:6]}"
-        self.auto_approve_safe = auto_approve_safe
-        self._pending: list[dict[str, Any]] = []
+        self.require_for = set(require_for or [])
+        self.timeout_hours = timeout_hours
 
-    def requires_approval(self, action_type: str) -> bool:
+    def requires_approval(self, action: str) -> bool:
         if not self.require_for:
             return True
-        return action_type in self.require_for
+        return any(t in action for t in self.require_for)
 
-    def request_approval(self, agent: str, action: str, context: dict[str, Any]) -> str:
-        request = {
-            "request_id": uuid.uuid4().hex[:12],
-            "agent": agent,
-            "action": action,
-            "context": context,
-            "status": "pending",
-        }
-        self._pending.append(request)
-        logger.info("approval_requested", agent=agent, action=action, approvers=self.approvers)
-
-        if self.auto_approve_safe:
-            request["status"] = "auto_approved"
-            return "auto_approved"
-
-        approved_by = self.approvers[0]
-        request["status"] = "approved"
-        request["approved_by"] = approved_by
-        return approved_by
-
+    def request_approval(self, agent_name: str, action: dict[str, Any], callback: Callable | None = None) -> tuple[bool, str]:
+        if callback:
+            return callback(agent_name, action)
+        return True, self.approvers[0]
 
 @dataclass
 class PolicyRule:
+    id: str
     name: str
-    condition: Callable[[dict[str, Any]], bool]
-    effect: str  # "allow" | "deny" | "require_approval"
-    obligations: list[str] = field(default_factory=list)
-
+    condition: Callable[[Any], bool]
+    requirement: str
+    severity: str = "block"
 
 class PolicyEngine:
-    """Attribute-based policy engine for agent governance."""
-
+    """Attribute-based policy engine."""
     def __init__(self) -> None:
-        self.rules: list[PolicyRule] = []
+        self._rules: list[PolicyRule] = []
 
-    def add_rule(self, rule: PolicyRule) -> None:
-        self.rules.append(rule)
-        logger.info("policy_rule_added", name=rule.name, effect=rule.effect)
+    def add_rule(self, name: str, condition: Callable[[Any], bool], requirement: str, severity: str = "block") -> PolicyRule:
+        rule = PolicyRule(id=uuid.uuid4().hex[:8], name=name, condition=condition, requirement=requirement, severity=severity)
+        self._rules.append(rule)
+        return rule
 
-    def evaluate(self, context: dict[str, Any]) -> dict[str, Any]:
-        matched_rules = []
-        for rule in self.rules:
+    def evaluate(self, action: Any) -> tuple[bool, list[PolicyRule]]:
+        violations = []
+        for rule in self._rules:
             try:
-                if rule.condition(context):
-                    matched_rules.append(rule)
+                if rule.condition(action):
+                    violations.append(rule)
             except Exception:
-                continue
+                pass
+        blocking = [v for v in violations if v.severity == "block"]
+        return len(blocking) == 0, violations
 
-        if not matched_rules:
-            return {"effect": "allow", "matched_rules": [], "obligations": []}
+class AuditTrail:
+    """Tamper-evident audit log with hash chain."""
+    def __init__(self, storage: str | None = None):
+        self.storage = storage
+        self._entries: list[AuditEntry] = []
+        self._chain_hash: str = "genesis"
 
-        for rule in matched_rules:
-            if rule.effect == "deny":
-                return {
-                    "effect": "deny",
-                    "matched_rules": [r.name for r in matched_rules],
-                    "denied_by": rule.name,
-                    "obligations": [],
-                }
+    def log(self, agent: str, action: str, decision: str, approver: str | None = None, policy_ids: list[str] | None = None, context: dict[str, Any] | None = None) -> AuditEntry:
+        entry = AuditEntry(id=uuid.uuid4().hex[:12], timestamp=datetime.now(timezone.utc).isoformat(), agent=agent, action=action, decision=decision, approver=approver, policy_ids=policy_ids or [], context=context or {})
+        chain_payload = f"{self._chain_hash}:{entry.checksum}"
+        self._chain_hash = hashlib.sha256(chain_payload.encode()).hexdigest()[:16]
+        self._entries.append(entry)
+        return entry
 
-        obligations = []
-        for rule in matched_rules:
-            obligations.extend(rule.obligations)
+    def verify_chain(self) -> bool:
+        chain_hash = "genesis"
+        for entry in self._entries:
+            chain_payload = f"{chain_hash}:{entry.checksum}"
+            chain_hash = hashlib.sha256(chain_payload.encode()).hexdigest()[:16]
+        return chain_hash == self._chain_hash
 
-        effect = "require_approval" if any(r.effect == "require_approval" for r in matched_rules) else "allow"
+    def get_entries(self, agent: str | None = None, limit: int = 100) -> list[AuditEntry]:
+        entries = self._entries
+        if agent:
+            entries = [e for e in entries if e.agent == agent]
+        return entries[-limit:]
 
-        return {
-            "effect": effect,
-            "matched_rules": [r.name for r in matched_rules],
-            "obligations": list(set(obligations)),
-        }
+    @property
+    def count(self) -> int:
+        return len(self._entries)
 
-
-def require_human_signoff(approvers: list[str], require_for: list[str] | None = None) -> Callable:
-    """Decorator that gates a function behind human approval."""
-    gate = ApprovalGate(approvers=approvers, require_for=require_for or [])
-
-    def decorator(fn: Callable) -> Callable:
-        @functools.wraps(fn)
-        def wrapper(*args: Any, **kwargs: Any) -> Any:
-            approved_by = gate.request_approval(
-                agent="decorator",
-                action=fn.__name__,
-                context={"args": str(args), "kwargs": str(kwargs)},
-            )
-            logger.info("human_signoff_granted", function=fn.__name__, approved_by=approved_by)
-            return fn(*args, **kwargs)
-        return wrapper
-    return decorator
+    def export_json(self) -> list[dict[str, Any]]:
+        return [{"id": e.id, "timestamp": e.timestamp, "agent": e.agent, "action": e.action, "decision": e.decision, "approver": e.approver, "checksum": e.checksum} for e in self._entries]

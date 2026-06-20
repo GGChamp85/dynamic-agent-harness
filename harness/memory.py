@@ -1,245 +1,126 @@
-"""5-layer biologically inspired memory stack for AI agents."""
-
+"""5-Layer Memory Stack — biologically-inspired memory for persistent agent intelligence."""
 from __future__ import annotations
-
-import uuid
-from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
-import structlog
-
-logger = structlog.get_logger()
-
-
-@dataclass
-class MemoryEntry:
-    content: Any
-    entry_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
-    metadata: dict[str, Any] = field(default_factory=dict)
-
-
 class WorkingMemory:
-    """Layer 1: In-context state for the current turn (prefrontal cortex).
-
-    Bounded by a configurable window size. Resets at session end.
-    """
-
-    def __init__(self, max_items: int = 50) -> None:
-        self.max_items = max_items
-        self._buffer: deque[MemoryEntry] = deque(maxlen=max_items)
-
-    def add(self, content: Any, **metadata: Any) -> MemoryEntry:
-        entry = MemoryEntry(content=content, metadata=metadata)
-        self._buffer.append(entry)
-        return entry
-
-    def get_context(self) -> list[MemoryEntry]:
-        return list(self._buffer)
-
+    """Layer 1: In-context state for the current turn. Analogous to prefrontal cortex."""
+    def __init__(self, backend: str | None = None, max_entries: int = 100):
+        self.backend = backend
+        self.max_entries = max_entries
+        self._store: dict[str, Any] = {}
+    def set(self, key: str, value: Any) -> None:
+        if len(self._store) >= self.max_entries:
+            oldest = next(iter(self._store))
+            del self._store[oldest]
+        self._store[key] = value
+    def get(self, key: str, default: Any = None) -> Any:
+        return self._store.get(key, default)
     def clear(self) -> None:
-        self._buffer.clear()
-
+        self._store.clear()
     @property
     def size(self) -> int:
-        return len(self._buffer)
-
+        return len(self._store)
 
 class EpisodicMemory:
-    """Layer 2: Append-only traces of what happened across sessions (hippocampus).
-
-    Retrieved at planning time to inform agent decisions with past experience.
-    """
-
-    def __init__(self) -> None:
-        self._episodes: list[MemoryEntry] = []
-
-    def append(self, content: Any, session_id: str | None = None, **metadata: Any) -> MemoryEntry:
-        entry = MemoryEntry(content=content, metadata={"session_id": session_id, **metadata})
-        self._episodes.append(entry)
-        logger.debug("episodic_trace_appended", entry_id=entry.entry_id)
-        return entry
-
-    def retrieve(self, session_id: str | None = None, limit: int = 20) -> list[MemoryEntry]:
-        if session_id:
-            filtered = [e for e in self._episodes if e.metadata.get("session_id") == session_id]
-            return filtered[-limit:]
-        return self._episodes[-limit:]
-
+    """Layer 2: Append-only traces across sessions. Analogous to hippocampus."""
+    def __init__(self, backend: str | None = None):
+        self.backend = backend
+        self._traces: list[dict[str, Any]] = []
+    def append(self, trace: dict[str, Any]) -> int:
+        self._traces.append(trace)
+        return len(self._traces) - 1
+    def recall(self, task: str | None = None, limit: int = 10) -> list[dict[str, Any]]:
+        if task:
+            matches = [t for t in self._traces if task.lower() in str(t).lower()]
+            return matches[-limit:]
+        return self._traces[-limit:]
     @property
-    def size(self) -> int:
-        return len(self._episodes)
-
+    def count(self) -> int:
+        return len(self._traces)
 
 class SemanticMemory:
-    """Layer 3: Entity store of typed attributes (temporal lobe).
-
-    Built by extraction jobs reading episodes. Supports dedup and resolution on write.
-    In production, backed by a vector database (ChromaDB, Pinecone, etc.).
-    """
-
-    def __init__(self) -> None:
-        self._entities: dict[str, MemoryEntry] = {}
-
-    def store(self, entity_id: str, attributes: dict[str, Any], **metadata: Any) -> MemoryEntry:
+    """Layer 3: Entity store of typed attributes. Analogous to temporal lobe."""
+    def __init__(self, backend: str | None = None):
+        self.backend = backend
+        self._entities: dict[str, dict[str, Any]] = {}
+    def store(self, entity_id: str, attributes: dict[str, Any]) -> None:
         if entity_id in self._entities:
-            existing = self._entities[entity_id]
-            existing.content.update(attributes)
-            existing.metadata.update(metadata)
-            return existing
-        entry = MemoryEntry(content=attributes, metadata=metadata)
-        self._entities[entity_id] = entry
-        return entry
-
-    def retrieve(self, entity_id: str) -> MemoryEntry | None:
+            self._entities[entity_id].update(attributes)
+        else:
+            self._entities[entity_id] = dict(attributes)
+    def retrieve(self, entity_id: str) -> dict[str, Any] | None:
         return self._entities.get(entity_id)
-
-    def search(self, query: str, top_k: int = 5) -> list[MemoryEntry]:
-        """Semantic search across entities. In production, uses vector similarity."""
-        results = []
-        query_lower = query.lower()
-        for eid, entry in self._entities.items():
-            if query_lower in eid.lower() or query_lower in str(entry.content).lower():
-                results.append(entry)
-                if len(results) >= top_k:
-                    break
-        return results
-
+    def search(self, query: str, limit: int = 10) -> list[tuple[str, dict[str, Any]]]:
+        q = query.lower()
+        return [(eid, a) for eid, a in self._entities.items() if q in eid.lower() or q in str(a).lower()][:limit]
     @property
-    def size(self) -> int:
+    def count(self) -> int:
         return len(self._entities)
 
+@dataclass
+class Skill:
+    name: str
+    steps: list[str]
+    success_rate: float = 0.0
+    version: int = 1
+    usage_count: int = 0
 
 class ProceduralMemory:
-    """Layer 4: Versioned skill registry of procedures (basal ganglia + cerebellum).
-
-    Built by reflection passes over past episodes. In production, backed by
-    a graph database (Neo4j) for versioning and dependency tracking.
-    """
-
-    def __init__(self) -> None:
-        self._procedures: dict[str, list[MemoryEntry]] = {}
-
-    def register(self, procedure_name: str, steps: list[str], version: int = 1, **metadata: Any) -> MemoryEntry:
-        entry = MemoryEntry(
-            content={"steps": steps, "version": version},
-            metadata={"procedure_name": procedure_name, **metadata},
-        )
-        if procedure_name not in self._procedures:
-            self._procedures[procedure_name] = []
-        self._procedures[procedure_name].append(entry)
-        logger.debug("procedure_registered", name=procedure_name, version=version)
-        return entry
-
-    def get_latest(self, procedure_name: str) -> MemoryEntry | None:
-        versions = self._procedures.get(procedure_name, [])
-        return versions[-1] if versions else None
-
-    def list_procedures(self) -> list[str]:
-        return list(self._procedures.keys())
-
+    """Layer 4: Versioned skill registry. Analogous to basal ganglia + cerebellum."""
+    def __init__(self, backend: str | None = None):
+        self.backend = backend
+        self._skills: dict[str, Skill] = {}
+    def register_skill(self, name: str, steps: list[str], success_rate: float = 0.0) -> Skill:
+        if name in self._skills:
+            s = self._skills[name]
+            s.steps = steps; s.success_rate = success_rate; s.version += 1
+            return s
+        skill = Skill(name=name, steps=steps, success_rate=success_rate)
+        self._skills[name] = skill
+        return skill
+    def get_skill(self, name: str) -> Skill | None:
+        return self._skills.get(name)
+    def best_skill_for(self, task: str) -> Skill | None:
+        task_lower = task.lower()
+        candidates = [s for s in self._skills.values() if any(w in task_lower for w in s.name.lower().split("-"))]
+        return max(candidates, key=lambda s: s.success_rate) if candidates else None
     @property
-    def size(self) -> int:
-        return sum(len(v) for v in self._procedures.values())
-
+    def count(self) -> int:
+        return len(self._skills)
 
 class MetaMemory:
-    """Layer 5: Governs the other four layers (anterior prefrontal cortex).
-
-    Manages retention policies, decay, compression, dedup, and forgetting.
-    Runs on schedule or when triggered by threshold conditions.
-    """
-
-    def __init__(
-        self,
-        max_episodic: int = 10_000,
-        max_working: int = 50,
-        decay_threshold_days: int = 90,
-    ) -> None:
-        self.max_episodic = max_episodic
-        self.max_working = max_working
-        self.decay_threshold_days = decay_threshold_days
-        self._policies: list[dict[str, Any]] = []
-
-    def add_policy(self, name: str, layer: str, action: str, condition: str) -> None:
-        self._policies.append({
-            "name": name,
-            "layer": layer,
-            "action": action,
-            "condition": condition,
-        })
-
-    def run_maintenance(
-        self,
-        working: WorkingMemory,
-        episodic: EpisodicMemory,
-        semantic: SemanticMemory,
-        procedural: ProceduralMemory,
-    ) -> dict[str, Any]:
-        """Run scheduled maintenance across all memory layers."""
-        report: dict[str, Any] = {"actions_taken": []}
-
-        if episodic.size > self.max_episodic:
-            overflow = episodic.size - self.max_episodic
-            report["actions_taken"].append(f"episodic: flagged {overflow} entries for archival")
-
-        report["layer_sizes"] = {
-            "working": working.size,
-            "episodic": episodic.size,
-            "semantic": semantic.size,
-            "procedural": procedural.size,
-        }
-
-        logger.info("meta_maintenance_completed", **report)
+    """Layer 5: Governs the other four. Analogous to anterior prefrontal cortex."""
+    def __init__(self, working: WorkingMemory | None = None, episodic: EpisodicMemory | None = None, semantic: SemanticMemory | None = None, procedural: ProceduralMemory | None = None):
+        self._working = working; self._episodic = episodic; self._semantic = semantic; self._procedural = procedural
+        self._maintenance_runs = 0
+    def run_maintenance(self) -> dict[str, Any]:
+        report: dict[str, Any] = {"actions": []}
+        if self._working and self._working.size > self._working.max_entries * 0.9:
+            self._working.clear(); report["actions"].append("working_memory_cleared")
+        if self._episodic and self._episodic.count > 1000:
+            report["actions"].append(f"episodic_has_{self._episodic.count}_traces")
+        if self._procedural:
+            for s in self._procedural._skills.values():
+                if s.success_rate < 0.3 and s.usage_count > 5:
+                    report["actions"].append(f"deprecate_{s.name}")
+        self._maintenance_runs += 1; report["run"] = self._maintenance_runs
         return report
 
-
 class MemoryPipeline:
-    """Orchestrates the 5-layer memory stack for each agent turn.
-
-    Runtime pipeline:
-    1. User input → Working Memory (sync)
-    2. LLM planning reads Episodic/Semantic/Procedural
-    3. After turn: episodic trace appended (sync)
-    4. Semantic extraction job (async)
-    5. Procedural reflection pass (async batch)
-    6. Meta-Memory maintenance (scheduled)
-    """
-
-    def __init__(self) -> None:
-        self.working = WorkingMemory()
-        self.episodic = EpisodicMemory()
-        self.semantic = SemanticMemory()
-        self.procedural = ProceduralMemory()
-        self.meta = MetaMemory()
-
-    def process_turn(
-        self,
-        user_input: str,
-        agent_response: str,
-        session_id: str | None = None,
-    ) -> dict[str, Any]:
-        self.working.add({"role": "user", "content": user_input})
-        self.working.add({"role": "assistant", "content": agent_response})
-
-        self.episodic.append(
-            content={"input": user_input, "response": agent_response},
-            session_id=session_id,
-        )
-
-        logger.info("turn_processed", working_size=self.working.size, episodic_size=self.episodic.size)
-
-        return {
-            "working_size": self.working.size,
-            "episodic_size": self.episodic.size,
-            "semantic_size": self.semantic.size,
-            "procedural_size": self.procedural.size,
-        }
-
-    def get_planning_context(self, query: str, session_id: str | None = None) -> dict[str, Any]:
-        return {
-            "working": [e.content for e in self.working.get_context()],
-            "recent_episodes": [e.content for e in self.episodic.retrieve(session_id=session_id, limit=10)],
-            "semantic_matches": [e.content for e in self.semantic.search(query, top_k=5)],
-            "procedures": self.procedural.list_procedures(),
-        }
+    """Orchestrates all 5 memory layers."""
+    def __init__(self, working_backend: str | None = None, episodic_backend: str | None = None, semantic_backend: str | None = None, procedural_backend: str | None = None):
+        self.working = WorkingMemory(backend=working_backend)
+        self.episodic = EpisodicMemory(backend=episodic_backend)
+        self.semantic = SemanticMemory(backend=semantic_backend)
+        self.procedural = ProceduralMemory(backend=procedural_backend)
+        self.meta = MetaMemory(working=self.working, episodic=self.episodic, semantic=self.semantic, procedural=self.procedural)
+    def after_turn(self, trace: dict[str, Any]) -> None:
+        self.episodic.append(trace)
+        for eid, attrs in trace.get("entities_observed", {}).items():
+            self.semantic.store(eid, attrs)
+        if trace.get("outcome") == "success" and trace.get("steps"):
+            task = trace.get("task", "unnamed")
+            existing = self.procedural.get_skill(task)
+            rate = existing.success_rate * 0.9 + 0.1 if existing else 0.5
+            self.procedural.register_skill(task, trace["steps"], success_rate=rate)

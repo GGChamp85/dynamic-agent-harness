@@ -1,129 +1,78 @@
-"""Enterprise knowledge graph for domain-led agent development."""
-
+"""Knowledge Graph — decode your enterprise before any agent acts."""
 from __future__ import annotations
-
 from dataclasses import dataclass, field
 from typing import Any
-
-import structlog
-
-logger = structlog.get_logger()
-
 
 @dataclass
 class Entity:
     id: str
-    kind: str
+    type: str
     attributes: dict[str, Any] = field(default_factory=dict)
-    tags: list[str] = field(default_factory=list)
-
 
 @dataclass
 class Relation:
-    source_id: str
-    target_id: str
-    relation_type: str
+    source: str
+    relation: str
+    target: str
     attributes: dict[str, Any] = field(default_factory=dict)
 
-
 class KnowledgeGraph:
-    """Living knowledge graph that decodes enterprise context for agents.
-
-    Entities represent business objects (tables, APIs, rules, decisions).
-    Relations capture how they connect. Agents query this graph to ground
-    their actions in real domain knowledge — not generic prompts.
-    """
-
+    """In-memory knowledge graph for enterprise domain modeling."""
     def __init__(self) -> None:
-        self.entities: dict[str, Entity] = {}
-        self.relations: list[Relation] = []
+        self._entities: dict[str, Entity] = {}
+        self._relations: list[Relation] = []
 
-    def add_entity(self, id: str, kind: str, attributes: dict[str, Any] | None = None, tags: list[str] | None = None) -> Entity:
-        entity = Entity(id=id, kind=kind, attributes=attributes or {}, tags=tags or [])
-        self.entities[id] = entity
-        logger.info("entity_added", id=id, kind=kind)
+    def add_entity(self, id: str, type: str, attributes: dict[str, Any] | None = None) -> Entity:
+        entity = Entity(id=id, type=type, attributes=attributes or {})
+        self._entities[id] = entity
         return entity
 
-    def add_relation(self, source_id: str, target_id: str, relation_type: str, attributes: dict[str, Any] | None = None) -> Relation:
-        if source_id not in self.entities:
-            raise KeyError(f"Source entity '{source_id}' not found")
-        if target_id not in self.entities:
-            raise KeyError(f"Target entity '{target_id}' not found")
-        relation = Relation(
-            source_id=source_id,
-            target_id=target_id,
-            relation_type=relation_type,
-            attributes=attributes or {},
-        )
-        self.relations.append(relation)
-        logger.info("relation_added", source=source_id, target=target_id, type=relation_type)
-        return relation
-
     def get_entity(self, id: str) -> Entity | None:
-        return self.entities.get(id)
+        return self._entities.get(id)
 
-    def query(self, kind: str | None = None, **attr_filters: Any) -> list[Entity]:
-        results = []
-        for entity in self.entities.values():
-            if kind and entity.kind != kind:
-                continue
-            match = all(
-                entity.attributes.get(k) == v
-                for k, v in attr_filters.items()
-            )
-            if match:
-                results.append(entity)
-        return results
+    def add_relation(self, source: str, relation: str, target: str, attributes: dict[str, Any] | None = None) -> Relation:
+        rel = Relation(source=source, relation=relation, target=target, attributes=attributes or {})
+        self._relations.append(rel)
+        return rel
 
-    def get_relations(self, entity_id: str, relation_type: str | None = None, direction: str = "outgoing") -> list[Relation]:
-        results = []
-        for rel in self.relations:
-            if direction in ("outgoing", "both") and rel.source_id == entity_id:
-                if relation_type is None or rel.relation_type == relation_type:
-                    results.append(rel)
-            if direction in ("incoming", "both") and rel.target_id == entity_id:
-                if relation_type is None or rel.relation_type == relation_type:
-                    results.append(rel)
-        return results
+    def query(self, entity_id: str, depth: int = 1) -> dict[str, Any]:
+        entity = self._entities.get(entity_id)
+        if not entity:
+            return {}
+        result: dict[str, Any] = {"entity": {"id": entity.id, "type": entity.type, **entity.attributes}, "relations": []}
+        visited = {entity_id}
+        frontier = [entity_id]
+        for _ in range(depth):
+            next_frontier: list[str] = []
+            for cid in frontier:
+                for rel in self._relations:
+                    if rel.source == cid and rel.target not in visited:
+                        target = self._entities.get(rel.target)
+                        result["relations"].append({"source": rel.source, "relation": rel.relation, "target": rel.target, "target_type": target.type if target else "unknown"})
+                        visited.add(rel.target); next_frontier.append(rel.target)
+                    elif rel.target == cid and rel.source not in visited:
+                        source = self._entities.get(rel.source)
+                        result["relations"].append({"source": rel.source, "relation": rel.relation, "target": rel.target, "source_type": source.type if source else "unknown"})
+                        visited.add(rel.source); next_frontier.append(rel.source)
+            frontier = next_frontier
+        return result
 
-    def decode_enterprise(self, sources: list[str]) -> dict[str, int]:
-        """Decode enterprise systems into the knowledge graph.
+    def find_entities(self, filters: dict[str, Any]) -> list[Entity]:
+        return [e for e in self._entities.values() if all(e.attributes.get(k) == v for k, v in filters.items())]
 
-        Connects to databases, reads codebases, and parses documentation
-        to extract entities and relations automatically.
-        """
-        logger.info("decode_started", source_count=len(sources))
-        entities_before = len(self.entities)
-        relations_before = len(self.relations)
+    def impact_analysis(self, entity_id: str, depth: int = 3) -> dict[str, Any]:
+        result = self.query(entity_id, depth=depth)
+        dependents = [r for r in self._relations if r.target == entity_id and r.relation in ("depends_on", "reads_from", "calls")]
+        return {**result, "direct_dependents": len(dependents), "total_in_blast_radius": len(result.get("relations", [])) + 1, "dependent_services": [{"id": d.source, "relation": d.relation} for d in dependents]}
 
-        for source in sources:
-            if source.startswith("postgresql://") or source.startswith("mysql://"):
-                self._decode_database(source)
-            elif source.endswith("/") or source.startswith("./"):
-                self._decode_codebase(source)
-            else:
-                self._decode_document(source)
+    def decode_enterprise(self) -> dict[str, Any]:
+        types: dict[str, int] = {}
+        for e in self._entities.values():
+            types[e.type] = types.get(e.type, 0) + 1
+        return {"total_entities": len(self._entities), "total_relations": len(self._relations), "entity_types": types}
 
-        added_entities = len(self.entities) - entities_before
-        added_relations = len(self.relations) - relations_before
-        logger.info("decode_completed", new_entities=added_entities, new_relations=added_relations)
-        return {"entities": added_entities, "relations": added_relations}
+    def __len__(self) -> int:
+        return len(self._entities)
 
-    def _decode_database(self, connection_string: str) -> None:
-        logger.info("decoding_database", source=connection_string.split("@")[-1] if "@" in connection_string else connection_string)
-
-    def _decode_codebase(self, path: str) -> None:
-        logger.info("decoding_codebase", path=path)
-
-    def _decode_document(self, path: str) -> None:
-        logger.info("decoding_document", path=path)
-
-    def stats(self) -> dict[str, int]:
-        kinds = {}
-        for e in self.entities.values():
-            kinds[e.kind] = kinds.get(e.kind, 0) + 1
-        return {
-            "total_entities": len(self.entities),
-            "total_relations": len(self.relations),
-            "entity_kinds": kinds,
-        }
+    def __repr__(self) -> str:
+        return f"KnowledgeGraph(entities={len(self._entities)}, relations={len(self._relations)})"
